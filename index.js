@@ -36,7 +36,7 @@ app.post("/incoming-call", (req, res) => {
                 "@voice": "Google.en-US-Chirp3-HD-Aoede",
                 "#": "Okay — you can start talking now!"
             },
-            Connect: { Stream: { "@url": `wss://${host}/media-stream` } }
+            Connect: { Stream: { "@url": `wss:// https://aivoice-o1it.onrender.com/media-stream` } }
         }
     }).end({ prettyPrint: true });
 
