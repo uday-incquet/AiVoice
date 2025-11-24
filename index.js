@@ -54,9 +54,7 @@ app.get("/token", (req, res) => {
 
 app.post("/incoming-call", (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
-    twiml.say({ voice: "Google.en-US-Chirp3-HD-Aoede" }, "Please wait while we connect you to the Gemini voice assistant.");
-    twiml.pause({ length: 1 });
-    twiml.say({ voice: "Google.en-US-Chirp3-HD-Aoede" }, "Okay — you can start talking now!");
+    // Remove the TTS greeting - let Gemini respond to the caller's voice
     const connect = twiml.connect();
     connect.stream({ url: `wss://${req.headers.host}/media-stream` });
     res.type("text/xml").send(twiml.toString());
@@ -161,7 +159,6 @@ wss.on("connection", async (twilioWs, req) => {
 
     // Queue media frames received before Gemini session is ready
     const pendingMedia = [];
-    let startEventPendingPrompt = false;
 
     // Twilio message handler (attach immediately)
     twilioWs.on("message", (raw) => {
@@ -172,7 +169,6 @@ wss.on("connection", async (twilioWs, req) => {
             case "start":
                 streamSid = event.start.streamSid;
                 console.log("Twilio stream start:", streamSid);
-                startEventPendingPrompt = true;
                 break;
             case "media":
                 if (!streamSid) return;
@@ -212,7 +208,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
 
-    // Start Gemini live session - USE AWAIT to get the actual session object
+    // Start Gemini live session
     try {
         session = await ai.live.connect({
             model: liveModel,
@@ -225,6 +221,12 @@ wss.on("connection", async (twilioWs, req) => {
                             voiceName: "Zephyr"
                         }
                     }
+                },
+                // Add system instruction for the assistant's behavior
+                systemInstruction: {
+                    parts: [{
+                        text: "You are a helpful voice assistant. When someone speaks to you, respond naturally and conversationally. Keep your responses concise and friendly."
+                    }]
                 }
             },
             callbacks: {
@@ -232,26 +234,25 @@ wss.on("connection", async (twilioWs, req) => {
                     console.log("Gemini Live session opened.");
                     sessionReady = true;
 
-                    // Send initial prompt if Twilio start already happened
-                    if (startEventPendingPrompt && session) {
-                        session.sendClientContent({
-                            turns: [{
-                                role: "user",
-                                parts: [{ text: "You are a helpful real-time voice assistant. Greet the caller briefly. as soon as someone connects start talking without waiting for them to start first." }]
-                            }]
-                        });
-                    }
-
-                    // Flush queued media
+                    // Flush queued media - start processing audio immediately
+                    console.log(`Flushing ${pendingMedia.length} queued audio frames`);
                     for (const ev of pendingMedia) forwardTwilioAudioToGemini(ev);
                     pendingMedia.length = 0;
                 },
                 onmessage: (message) => {
+                    // Log message type for debugging
+                    console.log("📩 Gemini message:", Object.keys(message));
+
                     const parts = message.serverContent?.modelTurn?.parts;
                     if (Array.isArray(parts)) {
+                        console.log(`📦 Received ${parts.length} part(s)`);
                         for (const part of parts) {
                             if (part.inlineData?.mimeType?.startsWith("audio/")) {
-                                if (!streamSid) return;
+                                console.log("🔊 Processing audio response");
+                                if (!streamSid) {
+                                    console.warn("⚠️ No streamSid");
+                                    return;
+                                }
                                 const mime = part.inlineData.mimeType;
                                 const b64 = part.inlineData.data;
                                 if (!b64) return;
@@ -263,7 +264,7 @@ wss.on("connection", async (twilioWs, req) => {
                                 const rateMatch = mime.match(/rate=(\d+)/);
                                 if (rateMatch) rate = parseInt(rateMatch[1], 10);
 
-                                // If 24000 Hz -> crude downsample to 16k
+                                // If 24000 Hz -> downsample to 16k
                                 let int16 = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.length / 2);
                                 if (rate === 24000) {
                                     const targetLen = Math.floor(int16.length * (16000 / 24000));
@@ -284,15 +285,16 @@ wss.on("connection", async (twilioWs, req) => {
                                     streamSid,
                                     media: { payload: bufferToBase64(mulawBuf) }
                                 }));
+                                console.log("✅ Audio sent to Twilio");
                             } else if (part.text) {
-                                console.log("Gemini text:", part.text);
+                                console.log("💬 Gemini text:", part.text);
                             }
                         }
                     }
                 },
-                onerror: (e) => console.error("Gemini live error:", e.message),
+                onerror: (e) => console.error("❌ Gemini live error:", e.message),
                 onclose: (e) => {
-                    console.log("Gemini live closed:", e.reason);
+                    console.log("🔌 Gemini live closed:", e.reason);
                     if (!closed) twilioWs.close();
                 }
             }
@@ -306,8 +308,14 @@ wss.on("connection", async (twilioWs, req) => {
     }
 
     // Helper to forward Twilio audio to Gemini
+    let audioFrameCount = 0;
     function forwardTwilioAudioToGemini(event) {
         if (!session || !sessionReady) return;
+
+        audioFrameCount++;
+        if (audioFrameCount % 50 === 0) {
+            console.log(`📥 Forwarded ${audioFrameCount} audio frames to Gemini`);
+        }
 
         const muLawBuf = Buffer.from(event.media.payload, "base64");
         const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuf);
