@@ -215,9 +215,9 @@ wss.on("connection", async (twilioWs, req) => {
 
     const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
 
-    // Start Gemini live session (do NOT await before handlers exist)
+    // Start Gemini live session - REMOVED await to fix timing issue
     try {
-        session = await ai.live.connect({
+        session = ai.live.connect({
             model: liveModel,
             config: {
                 responseModalities: ["AUDIO"],
