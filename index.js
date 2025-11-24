@@ -8,7 +8,7 @@ config();
 
 const PORT = process.env.PORT || 5050;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-live-2.5-flash-preview-native-audio-09-2025";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.5-flash-native-audio-preview-09-2025";
 
 const AccessToken = twilio.jwt.AccessToken;
 const VoiceGrant = AccessToken.VoiceGrant;
@@ -148,7 +148,6 @@ function downsample16kTo8k(int16Arr16k) {
    WebSocket bridge
 -------------------------*/
 
-
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", async (twilioWs, req) => {
@@ -173,13 +172,11 @@ wss.on("connection", async (twilioWs, req) => {
             case "start":
                 streamSid = event.start.streamSid;
                 console.log("Twilio stream start:", streamSid);
-                // We will send initial prompt after Gemini session opens
                 startEventPendingPrompt = true;
                 break;
             case "media":
-                if (!streamSid) return; // ignore until start received
+                if (!streamSid) return;
                 if (!sessionReady) {
-                    // stash media until session ready
                     pendingMedia.push(event);
                 } else {
                     forwardTwilioAudioToGemini(event);
@@ -215,18 +212,20 @@ wss.on("connection", async (twilioWs, req) => {
 
     const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
 
-    // Start Gemini live session - REMOVED await to fix timing issue
+    // Start Gemini live session - USE AWAIT to get the actual session object
     try {
-        session = ai.live.connect({
+        session = await ai.live.connect({
             model: liveModel,
             config: {
                 responseModalities: ["AUDIO"],
                 mediaResolution: "MEDIA_RESOLUTION_MEDIUM",
                 speechConfig: {
-                    voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } }
-                },
-                // Declare input audio format we will send
-                inputAudio: { format: "pcm16", sampleRateHertz: 16000 }
+                    voiceConfig: {
+                        prebuiltVoiceConfig: {
+                            voiceName: "Zephyr"
+                        }
+                    }
+                }
             },
             callbacks: {
                 onopen: () => {
@@ -234,7 +233,7 @@ wss.on("connection", async (twilioWs, req) => {
                     sessionReady = true;
 
                     // Send initial prompt if Twilio start already happened
-                    if (startEventPendingPrompt) {
+                    if (startEventPendingPrompt && session) {
                         session.sendClientContent({
                             turns: [{
                                 role: "user",
@@ -298,6 +297,8 @@ wss.on("connection", async (twilioWs, req) => {
                 }
             }
         });
+
+        console.log("Session created, ready to handle audio.");
     } catch (err) {
         console.error("Failed to open Gemini Live session:", err);
         twilioWs.close();
@@ -306,7 +307,8 @@ wss.on("connection", async (twilioWs, req) => {
 
     // Helper to forward Twilio audio to Gemini
     function forwardTwilioAudioToGemini(event) {
-        if (!session || sessionReady === false) return;
+        if (!session || !sessionReady) return;
+
         const muLawBuf = Buffer.from(event.media.payload, "base64");
         const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuf);
         const pcm16_16k = upsample8kTo16k(pcm16_8k);
@@ -320,7 +322,6 @@ wss.on("connection", async (twilioWs, req) => {
         });
     }
 });
-
 
 const server = app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
 
