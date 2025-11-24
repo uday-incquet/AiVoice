@@ -4,12 +4,15 @@ import { WebSocketServer, WebSocket } from "ws";
 import { config } from "dotenv";
 import xmlbuilder2 from "xmlbuilder2";
 const { xml } = xmlbuilder2;
+import twilio from "twilio";
 
 config();
 
 const PORT = process.env.PORT || 5050;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.5-flash-native-audio-preview-09-2025";
+const AccessToken = twilio.jwt.AccessToken;
+const VoiceGrant = AccessToken.VoiceGrant;
 
 if (!GEMINI_KEY) {
     throw new Error("Missing GEMINI_API_KEY in .env");
@@ -20,6 +23,39 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 app.get("/", (req, res) => res.json({ message: "Twilio + Gemini Live API bridge running" }));
+
+app.get("/token", (req, res) => {
+    try {
+        console.log(process.env.TWILIO_ACCOUNT_SID);
+        console.log('Generating token for accountSid:', process.env.TWILIO_ACCOUNT_SID);
+        const token = new AccessToken(
+            process.env.TWILIO_ACCOUNT_SID,
+            process.env.TWILIO_API_KEY,
+            process.env.TWILIO_API_SECRET,
+            {
+                identity: 'user123',
+                ttl: 86400
+            }
+        );
+
+        const voiceGrant = new VoiceGrant({
+            outgoingApplicationSid: process.env.TWIML_APP_SID,
+            incomingAllow: true,
+            outgoingAllow: true
+        });
+
+        token.addGrant(voiceGrant);
+        const jwt = token.toJwt();
+
+        res.json({
+            token: jwt,
+            identity: 'user123'
+        });
+    } catch (error) {
+        console.error('Error generating token:', error);
+        res.status(500).json({ error: 'Failed to generate token' });
+    }
+})
 
 app.post("/incoming-call", (req, res) => {
     const host = req.headers.host;
