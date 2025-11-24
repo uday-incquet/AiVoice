@@ -8,7 +8,7 @@ config();
 
 const PORT = process.env.PORT || 5050;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-live-2.5-flash-preview-native-audio-09-2025";
 
 const AccessToken = twilio.jwt.AccessToken;
 const VoiceGrant = AccessToken.VoiceGrant;
@@ -148,15 +148,28 @@ function downsample16kTo8k(int16Arr16k) {
    WebSocket bridge
 -------------------------*/
 
+// ...existing code...
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", async (twilioWs, req) => {
     console.log("Twilio connected.");
 
     const liveModel = GEMINI_MODEL.startsWith("models/") ? GEMINI_MODEL : `models/${GEMINI_MODEL}`;
-    const geminiWsUrl = `wss://generativelanguage.googleapis.com/v1alpha/${liveModel}:bidiConnect`;
+    const baseUrl = `wss://generativelanguage.googleapis.com/v1alpha/${liveModel}:bidiConnect`;
 
-    const geminiWs = new WebSocket(`${geminiWsUrl}?key=${GEMINI_KEY}`, {
+    // Preflight: fetch HTTPS version to see detailed error JSON
+    try {
+        const httpsUrl = baseUrl.replace("wss://", "https://");
+        const pre = await fetch(httpsUrl, { headers: { "X-Goog-Api-Key": GEMINI_KEY } });
+        const body = await pre.text();
+        console.log("Gemini HTTPS preflight:", pre.status, body.slice(0, 500));
+    } catch (e) {
+        console.warn("Gemini HTTPS preflight failed:", e.message);
+    }
+
+    // WS: use API key in header (no query param). Some deployments reject ?key=
+    const geminiWs = new WebSocket(baseUrl, {
+        headers: { "X-Goog-Api-Key": GEMINI_KEY },
         perMessageDeflate: false
     });
 
@@ -166,9 +179,12 @@ wss.on("connection", async (twilioWs, req) => {
     geminiWs.on("open", () => {
         console.log("Gemini WS open, sending setup.");
         setupSent = true;
+
         const setupMsg = {
             setup: {
                 model: liveModel,
+                // Live API requires declaring your input audio format
+                inputAudio: { format: "pcm16", sampleRateHertz: 16000 },
                 generationConfig: {
                     responseModalities: ["AUDIO", "TEXT"],
                     temperature: 0.7
@@ -183,9 +199,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     geminiWs.on("message", (raw) => {
         let msg;
-        try {
-            msg = JSON.parse(raw.toString());
-        } catch {
+        try { msg = JSON.parse(raw.toString()); } catch {
             console.warn("Non-JSON Gemini frame received.");
             return;
         }
@@ -221,7 +235,7 @@ wss.on("connection", async (twilioWs, req) => {
     geminiWs.on("close", (code, reason) => {
         console.log(`Gemini WS closed: ${code} ${reason || ""}`);
         if (!setupSent && code === 1006) {
-            console.error("Likely handshake failure: check your Gemini model name and API key.");
+            console.error("Handshake failure: verify endpoint, model name, and API key.");
         }
     });
 
@@ -229,9 +243,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     twilioWs.on("message", (msg) => {
         let event;
-        try {
-            event = JSON.parse(msg.toString());
-        } catch {
+        try { event = JSON.parse(msg.toString()); } catch {
             console.warn("Non-JSON Twilio frame received.");
             return;
         }
@@ -276,6 +288,7 @@ wss.on("connection", async (twilioWs, req) => {
 
     twilioWs.on("error", (err) => console.error("Twilio WS error:", err));
 });
+// ...existing code...
 
 const server = app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
 
