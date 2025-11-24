@@ -237,7 +237,7 @@ wss.on("connection", async (twilioWs, req) => {
                         session.sendClientContent({
                             turns: [{
                                 role: "user",
-                                parts: [{ text: "You are a helpful real-time voice assistant. Greet the caller briefly." }]
+                                parts: [{ text: "You are a helpful real-time voice assistant. Greet the caller briefly. as soon as someone connects start talking without waiting for them to start first." }]
                             }]
                         });
                     }
