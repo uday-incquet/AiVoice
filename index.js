@@ -5,6 +5,7 @@ import { config } from "dotenv";
 import xmlbuilder2 from "xmlbuilder2";
 const { xml } = xmlbuilder2;
 import twilio from "twilio";
+import cors from "cors";
 
 config();
 
