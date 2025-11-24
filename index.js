@@ -148,26 +148,74 @@ function downsample16kTo8k(int16Arr16k) {
    WebSocket bridge
 -------------------------*/
 
-// ...existing code...
 
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", async (twilioWs, req) => {
     console.log("Twilio connected.");
 
-    // Use the native audio preview model
     const liveModel = "models/gemini-2.5-flash-native-audio-preview-09-2025";
+    let streamSid = null;
+    let session = null;
+    let closed = false;
+    let sessionReady = false;
 
-    // Lazy import to avoid loading if no calls
-    const { GoogleGenAI } = await import('@google/genai');
+    // Queue media frames received before Gemini session is ready
+    const pendingMedia = [];
+    let startEventPendingPrompt = false;
+
+    // Twilio message handler (attach immediately)
+    twilioWs.on("message", (raw) => {
+        let event;
+        try { event = JSON.parse(raw.toString()); } catch { return; }
+
+        switch (event.event) {
+            case "start":
+                streamSid = event.start.streamSid;
+                console.log("Twilio stream start:", streamSid);
+                // We will send initial prompt after Gemini session opens
+                startEventPendingPrompt = true;
+                break;
+            case "media":
+                if (!streamSid) return; // ignore until start received
+                if (!sessionReady) {
+                    // stash media until session ready
+                    pendingMedia.push(event);
+                } else {
+                    forwardTwilioAudioToGemini(event);
+                }
+                break;
+            case "stop":
+                console.log("Twilio stream stopped.");
+                closed = true;
+                try { session?.close(); } catch { }
+                break;
+            default:
+                break;
+        }
+    });
+
+    twilioWs.on("close", () => {
+        console.log("Twilio WS closed.");
+        closed = true;
+        try { session?.close(); } catch { }
+    });
+
+    twilioWs.on("error", (err) => console.error("Twilio WS error:", err));
+
+    // Lazy import Gemini SDK
+    let GoogleGenAI;
+    try {
+        ({ GoogleGenAI } = await import("@google/genai"));
+    } catch (e) {
+        console.error("Missing @google/genai. Run: npm install @google/genai");
+        twilioWs.close();
+        return;
+    }
 
     const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
 
-    let session;
-    let streamSid = null;
-    let closed = false;
-
-    // Start live session
+    // Start Gemini live session (do NOT await before handlers exist)
     try {
         session = await ai.live.connect({
             model: liveModel,
@@ -176,15 +224,33 @@ wss.on("connection", async (twilioWs, req) => {
                 mediaResolution: "MEDIA_RESOLUTION_MEDIUM",
                 speechConfig: {
                     voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } }
-                }
+                },
+                // Declare input audio format we will send
+                inputAudio: { format: "pcm16", sampleRateHertz: 16000 }
             },
             callbacks: {
-                onopen: () => console.log("Gemini Live session opened."),
+                onopen: () => {
+                    console.log("Gemini Live session opened.");
+                    sessionReady = true;
+
+                    // Send initial prompt if Twilio start already happened
+                    if (startEventPendingPrompt) {
+                        session.sendClientContent({
+                            turns: [{
+                                role: "user",
+                                parts: [{ text: "You are a helpful real-time voice assistant. Greet the caller briefly." }]
+                            }]
+                        });
+                    }
+
+                    // Flush queued media
+                    for (const ev of pendingMedia) forwardTwilioAudioToGemini(ev);
+                    pendingMedia.length = 0;
+                },
                 onmessage: (message) => {
                     const parts = message.serverContent?.modelTurn?.parts;
                     if (Array.isArray(parts)) {
                         for (const part of parts) {
-                            // Native audio returns linear PCM (e.g. audio/L16;rate=16000)
                             if (part.inlineData?.mimeType?.startsWith("audio/")) {
                                 if (!streamSid) return;
                                 const mime = part.inlineData.mimeType;
@@ -192,29 +258,32 @@ wss.on("connection", async (twilioWs, req) => {
                                 if (!b64) return;
 
                                 const pcmBuf = Buffer.from(b64, "base64");
-                                // Parse sample rate
-                                let targetRate = 16000;
-                                const rateMatch = mime.match(/rate=(\d+)/);
-                                if (rateMatch) targetRate = parseInt(rateMatch[1], 10);
 
-                                // If >16k reduce to 16k simple decimation (then 16k->8k for Twilio)
+                                // Determine sample rate
+                                let rate = 16000;
+                                const rateMatch = mime.match(/rate=(\d+)/);
+                                if (rateMatch) rate = parseInt(rateMatch[1], 10);
+
+                                // If 24000 Hz -> crude downsample to 16k
                                 let int16 = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.length / 2);
-                                if (targetRate === 24000) {
-                                    // crude 24k->16k drop 1 of every 3 samples
-                                    const tmp = new Int16Array(Math.floor(int16.length * (16000 / 24000)));
+                                if (rate === 24000) {
+                                    const targetLen = Math.floor(int16.length * (16000 / 24000));
+                                    const tmp = new Int16Array(targetLen);
                                     let j = 0;
-                                    for (let i = 0; i < int16.length; i += 3) {
+                                    for (let i = 0; i < int16.length && j < targetLen; i += 3) {
                                         tmp[j++] = int16[i];
                                     }
                                     int16 = tmp;
                                 }
+
+                                // 16k -> 8k for Twilio
                                 const int16_8k = downsample16kTo8k(int16);
                                 const mulawBuf = pcm16Int16ArrayToMuLawBuffer(int16_8k);
 
                                 twilioWs.send(JSON.stringify({
                                     event: "media",
                                     streamSid,
-                                    media: { payload: mulawBuf.toString("base64") }
+                                    media: { payload: bufferToBase64(mulawBuf) }
                                 }));
                             } else if (part.text) {
                                 console.log("Gemini text:", part.text);
@@ -235,56 +304,23 @@ wss.on("connection", async (twilioWs, req) => {
         return;
     }
 
-    // Twilio inbound media
-    twilioWs.on("message", (msg) => {
-        let event;
-        try { event = JSON.parse(msg.toString()); } catch {
-            return;
-        }
-        switch (event.event) {
-            case "start":
-                streamSid = event.start.streamSid;
-                console.log("Twilio stream start:", streamSid);
-                // Optional initial prompt to model (text turn)
-                session.sendClientContent({
-                    turns: ["You are a helpful real-time voice assistant. Greet the caller briefly."]
-                });
-                break;
-            case "media":
-                if (!session) return;
-                // μ-law -> PCM16 8k -> upsample to 16k
-                const muLawBuf = Buffer.from(event.media.payload, "base64");
-                const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuf);
-                const pcm16_16k = upsample8kTo16k(pcm16_8k);
-                const pcmBuf = Buffer.from(pcm16_16k.buffer);
+    // Helper to forward Twilio audio to Gemini
+    function forwardTwilioAudioToGemini(event) {
+        if (!session || sessionReady === false) return;
+        const muLawBuf = Buffer.from(event.media.payload, "base64");
+        const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuf);
+        const pcm16_16k = upsample8kTo16k(pcm16_8k);
+        const pcmBuf = Buffer.from(pcm16_16k.buffer);
 
-                // Send as realtime audio chunk
-                session.sendRealtimeInput({
-                    mediaChunks: [{
-                        mimeType: "audio/L16;rate=16000",
-                        data: pcmBuf.toString("base64")
-                    }]
-                });
-                break;
-            case "stop":
-                console.log("Twilio stream stopped.");
-                closed = true;
-                try { session.close(); } catch { }
-                break;
-            default:
-                break;
-        }
-    });
-
-    twilioWs.on("close", () => {
-        console.log("Twilio WS closed.");
-        closed = true;
-        try { session.close(); } catch { }
-    });
-
-    twilioWs.on("error", (err) => console.error("Twilio WS error:", err));
+        session.sendRealtimeInput({
+            mediaChunks: [{
+                mimeType: "audio/L16;rate=16000",
+                data: pcmBuf.toString("base64")
+            }]
+        });
+    }
 });
-// ...existing code...
+
 
 const server = app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
 
