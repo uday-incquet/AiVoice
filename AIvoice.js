@@ -2,25 +2,29 @@
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import { config } from "dotenv";
-import { xml } from "xmlbuilder2";
-import tokenRoutes from './routes/token.js';
+import twilio from "twilio";
+import cors from "cors";
 
 config();
 
 const PORT = process.env.PORT || 5050;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.5-flash-native-audio-preview-09-2025";
+const AccessToken = twilio.jwt.AccessToken;
+const VoiceGrant = AccessToken.VoiceGrant;
 
 if (!GEMINI_KEY) {
     throw new Error("Missing GEMINI_API_KEY in .env");
 }
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+app.use(cors())
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+app.get("/", (req, res) => res.json({ message: "Twilio + Gemini Live API bridge running" }));
 
-app.get('/token', (req, res) => {
+app.get("/token", (req, res) => {
     try {
         console.log(process.env.TWILIO_ACCOUNT_SID);
         console.log('Generating token for accountSid:', process.env.TWILIO_ACCOUNT_SID);
@@ -51,28 +55,16 @@ app.get('/token', (req, res) => {
         console.error('Error generating token:', error);
         res.status(500).json({ error: 'Failed to generate token' });
     }
-});
+})
 
 app.post("/incoming-call", (req, res) => {
-    const host = req.headers.host;
-    const twiml = xml({
-        Response: {
-            Say: [
-                {
-                    "@voice": "Google.en-US-Chirp3-HD-Aoede",
-                    "#": "Please wait while we connect you to the Gemini voice assistant."
-                }
-            ],
-            Pause: { "@length": 1 },
-            Say: {
-                "@voice": "Google.en-US-Chirp3-HD-Aoede",
-                "#": "Okay — you can start talking now!"
-            },
-            Connect: { Stream: { "@url": `wss://${host}/media-stream` } }
-        }
-    }).end({ prettyPrint: true });
-
-    res.type("text/xml").send(twiml);
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.say({ voice: "Google.en-US-Chirp3-HD-Aoede" }, "Please wait while we connect you to the Gemini voice assistant.");
+    twiml.pause({ length: 1 });
+    twiml.say({ voice: "Google.en-US-Chirp3-HD-Aoede" }, "Okay — you can start talking now!");
+    const connect = twiml.connect();
+    connect.stream({ url: "wss://aivoice-o1it.onrender.com/media-stream" });
+    res.type("text/xml").send(twiml.toString());
 });
 
 /* -------------------------
