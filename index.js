@@ -149,132 +149,127 @@ function downsample16kTo8k(int16Arr16k) {
 -------------------------*/
 
 // ...existing code...
+
 const wss = new WebSocketServer({ noServer: true });
 
 wss.on("connection", async (twilioWs, req) => {
     console.log("Twilio connected.");
 
-    const liveModel = GEMINI_MODEL.startsWith("models/") ? GEMINI_MODEL : `models/${GEMINI_MODEL}`;
-    const baseUrl = `wss://generativelanguage.googleapis.com/v1alpha/${liveModel}:bidiConnect`;
+    // Use the native audio preview model
+    const liveModel = "models/gemini-2.5-flash-native-audio-preview-09-2025";
 
-    // Preflight: fetch HTTPS version to see detailed error JSON
+    // Lazy import to avoid loading if no calls
+    const { GoogleGenAI } = await import('@google/genai');
+
+    const ai = new GoogleGenAI({ apiKey: GEMINI_KEY });
+
+    let session;
+    let streamSid = null;
+    let closed = false;
+
+    // Start live session
     try {
-        const httpsUrl = baseUrl.replace("wss://", "https://");
-        const pre = await fetch(httpsUrl, { headers: { "X-Goog-Api-Key": GEMINI_KEY } });
-        const body = await pre.text();
-        console.log("Gemini HTTPS preflight:", pre.status, body.slice(0, 500));
-    } catch (e) {
-        console.warn("Gemini HTTPS preflight failed:", e.message);
+        session = await ai.live.connect({
+            model: liveModel,
+            config: {
+                responseModalities: ["AUDIO"],
+                mediaResolution: "MEDIA_RESOLUTION_MEDIUM",
+                speechConfig: {
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } }
+                }
+            },
+            callbacks: {
+                onopen: () => console.log("Gemini Live session opened."),
+                onmessage: (message) => {
+                    const parts = message.serverContent?.modelTurn?.parts;
+                    if (Array.isArray(parts)) {
+                        for (const part of parts) {
+                            // Native audio returns linear PCM (e.g. audio/L16;rate=16000)
+                            if (part.inlineData?.mimeType?.startsWith("audio/")) {
+                                if (!streamSid) return;
+                                const mime = part.inlineData.mimeType;
+                                const b64 = part.inlineData.data;
+                                if (!b64) return;
+
+                                const pcmBuf = Buffer.from(b64, "base64");
+                                // Parse sample rate
+                                let targetRate = 16000;
+                                const rateMatch = mime.match(/rate=(\d+)/);
+                                if (rateMatch) targetRate = parseInt(rateMatch[1], 10);
+
+                                // If >16k reduce to 16k simple decimation (then 16k->8k for Twilio)
+                                let int16 = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.length / 2);
+                                if (targetRate === 24000) {
+                                    // crude 24k->16k drop 1 of every 3 samples
+                                    const tmp = new Int16Array(Math.floor(int16.length * (16000 / 24000)));
+                                    let j = 0;
+                                    for (let i = 0; i < int16.length; i += 3) {
+                                        tmp[j++] = int16[i];
+                                    }
+                                    int16 = tmp;
+                                }
+                                const int16_8k = downsample16kTo8k(int16);
+                                const mulawBuf = pcm16Int16ArrayToMuLawBuffer(int16_8k);
+
+                                twilioWs.send(JSON.stringify({
+                                    event: "media",
+                                    streamSid,
+                                    media: { payload: mulawBuf.toString("base64") }
+                                }));
+                            } else if (part.text) {
+                                console.log("Gemini text:", part.text);
+                            }
+                        }
+                    }
+                },
+                onerror: (e) => console.error("Gemini live error:", e.message),
+                onclose: (e) => {
+                    console.log("Gemini live closed:", e.reason);
+                    if (!closed) twilioWs.close();
+                }
+            }
+        });
+    } catch (err) {
+        console.error("Failed to open Gemini Live session:", err);
+        twilioWs.close();
+        return;
     }
 
-    // WS: use API key in header (no query param). Some deployments reject ?key=
-    const geminiWs = new WebSocket(baseUrl, {
-        headers: { "X-Goog-Api-Key": GEMINI_KEY },
-        perMessageDeflate: false
-    });
-
-    let streamSid = null;
-    let setupSent = false;
-
-    geminiWs.on("open", () => {
-        console.log("Gemini WS open, sending setup.");
-        setupSent = true;
-
-        const setupMsg = {
-            setup: {
-                model: liveModel,
-                // Live API requires declaring your input audio format
-                inputAudio: { format: "pcm16", sampleRateHertz: 16000 },
-                generationConfig: {
-                    responseModalities: ["AUDIO", "TEXT"],
-                    temperature: 0.7
-                },
-                speechConfig: {
-                    voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } }
-                }
-            }
-        };
-        geminiWs.send(JSON.stringify(setupMsg));
-    });
-
-    geminiWs.on("message", (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw.toString()); } catch {
-            console.warn("Non-JSON Gemini frame received.");
-            return;
-        }
-
-        if (msg.error) {
-            console.error("Gemini error frame:", msg.error);
-            return;
-        }
-
-        const parts = msg.serverContent?.modelTurn?.parts;
-        if (Array.isArray(parts)) {
-            for (const part of parts) {
-                if (part.inlineData?.mimeType?.startsWith("audio/pcm")) {
-                    const b64 = part.inlineData.data;
-                    if (b64 && streamSid) {
-                        const pcmBuf = base64ToBuffer(b64);
-                        const int16 = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.length / 2);
-                        const int16_8k = downsample16kTo8k(int16);
-                        const mulawBuf = pcm16Int16ArrayToMuLawBuffer(int16_8k);
-                        twilioWs.send(JSON.stringify({
-                            event: "media",
-                            streamSid,
-                            media: { payload: bufferToBase64(mulawBuf) }
-                        }));
-                    }
-                } else if (part.text) {
-                    console.log("Gemini text:", part.text);
-                }
-            }
-        }
-    });
-
-    geminiWs.on("close", (code, reason) => {
-        console.log(`Gemini WS closed: ${code} ${reason || ""}`);
-        if (!setupSent && code === 1006) {
-            console.error("Handshake failure: verify endpoint, model name, and API key.");
-        }
-    });
-
-    geminiWs.on("error", (err) => console.error("Gemini WS error:", err));
-
+    // Twilio inbound media
     twilioWs.on("message", (msg) => {
         let event;
         try { event = JSON.parse(msg.toString()); } catch {
-            console.warn("Non-JSON Twilio frame received.");
             return;
         }
-
         switch (event.event) {
             case "start":
                 streamSid = event.start.streamSid;
                 console.log("Twilio stream start:", streamSid);
+                // Optional initial prompt to model (text turn)
+                session.sendClientContent({
+                    turns: ["You are a helpful real-time voice assistant. Greet the caller briefly."]
+                });
                 break;
             case "media":
-                if (geminiWs.readyState === WebSocket.OPEN) {
-                    const muLawBuf = base64ToBuffer(event.media.payload);
-                    const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuf);
-                    const pcm16_16k = upsample8kTo16k(pcm16_8k);
-                    const pcmBuf = Buffer.from(pcm16_16k.buffer);
-                    const realtimeInput = {
-                        realtimeInput: {
-                            mediaChunks: [{
-                                mimeType: "audio/pcm",
-                                data: bufferToBase64(pcmBuf)
-                            }]
-                        }
-                    };
-                    geminiWs.send(JSON.stringify(realtimeInput));
-                }
+                if (!session) return;
+                // μ-law -> PCM16 8k -> upsample to 16k
+                const muLawBuf = Buffer.from(event.media.payload, "base64");
+                const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuf);
+                const pcm16_16k = upsample8kTo16k(pcm16_8k);
+                const pcmBuf = Buffer.from(pcm16_16k.buffer);
+
+                // Send as realtime audio chunk
+                session.sendRealtimeInput({
+                    mediaChunks: [{
+                        mimeType: "audio/L16;rate=16000",
+                        data: pcmBuf.toString("base64")
+                    }]
+                });
                 break;
             case "stop":
                 console.log("Twilio stream stopped.");
-                if (geminiWs.readyState === WebSocket.OPEN) {
-                    try { geminiWs.close(); } catch { }
-                }
+                closed = true;
+                try { session.close(); } catch { }
                 break;
             default:
                 break;
@@ -282,8 +277,9 @@ wss.on("connection", async (twilioWs, req) => {
     });
 
     twilioWs.on("close", () => {
-        console.log("Twilio WS closed, closing Gemini WS.");
-        if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+        console.log("Twilio WS closed.");
+        closed = true;
+        try { session.close(); } catch { }
     });
 
     twilioWs.on("error", (err) => console.error("Twilio WS error:", err));
