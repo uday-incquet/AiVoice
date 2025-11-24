@@ -6,8 +6,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { GoogleGenAI, Modality, MediaResolution } from '@google/genai';
 import twilio from 'twilio';
-import { jwt } from 'twilio';
-const AccessToken = jwt.AccessToken;
+const AccessToken = twilio.jwt.AccessToken;
 const VoiceGrant = AccessToken.VoiceGrant;
 import 'dotenv/config';
 
