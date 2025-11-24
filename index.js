@@ -2,7 +2,6 @@
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import { config } from "dotenv";
-import create from "xmlbuilder2";
 import twilio from "twilio";
 import cors from "cors";
 
@@ -59,22 +58,13 @@ app.get("/token", (req, res) => {
 })
 
 app.post("/incoming-call", (req, res) => {
-    const twiml = create()
-        .ele("Response")
-        .ele("Say", { voice: "Google.en-US-Chirp3-HD-Aoede" })
-        .txt("Please wait while we connect you to the Gemini voice assistant.")
-        .up()
-        .ele("Pause", { length: 1 }).up()
-        .ele("Say", { voice: "Google.en-US-Chirp3-HD-Aoede" })
-        .txt("Okay — you can start talking now!")
-        .up()
-        .ele("Connect")
-        .ele("Stream", { url: "wss://aivoice-o1it.onrender.com/media-stream" }).up()
-        .up()
-        .up()
-        .end({ prettyPrint: true });
-
-    res.type("text/xml").send(twiml);
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.say({ voice: "Google.en-US-Chirp3-HD-Aoede" }, "Please wait while we connect you to the Gemini voice assistant.");
+    twiml.pause({ length: 1 });
+    twiml.say({ voice: "Google.en-US-Chirp3-HD-Aoede" }, "Okay — you can start talking now!");
+    const connect = twiml.connect();
+    connect.stream({ url: "wss://aivoice-o1it.onrender.com/media-stream" });
+    res.type("text/xml").send(twiml.toString());
 });
 
 /* -------------------------
