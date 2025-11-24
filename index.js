@@ -150,76 +150,131 @@ function downsample16kTo8k(int16Arr16k) {
 
 const wss = new WebSocketServer({ noServer: true });
 
+// ...existing code...
+
 wss.on("connection", async (twilioWs, req) => {
     console.log("Twilio connected.");
 
-    const geminiWsUrl = `wss://generativelanguage.googleapis.com/v1alpha/${GEMINI_MODEL}:bidiConnect?key=${GEMINI_KEY}`;
+    // Ensure model has prefix
+    const liveModel = GEMINI_MODEL.startsWith("models/") ? GEMINI_MODEL : `models/${GEMINI_MODEL}`;
 
-    const geminiWs = new WebSocket(geminiWsUrl);
+    // Preferred Live endpoint variant (adjust if docs specify different)
+    const geminiWsUrl = `wss://generativelanguage.googleapis.com/v1alpha/${liveModel}:bidiConnect`;
+
+    // Optional: do a preflight HTTP GET to capture error JSON (will 400 but we log body)
+    try {
+        const preflight = await fetch(`${geminiWsUrl}?key=${GEMINI_KEY}`);
+        if (!preflight.ok) {
+            const txt = await preflight.text();
+            console.warn("Gemini preflight status:", preflight.status, "body:", txt);
+        } else {
+            console.log("Preflight OK (unexpected for WS endpoint).");
+        }
+    } catch (e) {
+        console.warn("Preflight fetch error (expected for WS URL):", e.message);
+    }
+
+    // Open WS with subprotocol + header
+    const geminiWs = new WebSocket(`${geminiWsUrl}?key=${GEMINI_KEY}`, "llm-1", {
+        headers: {
+            "X-Goog-Api-Key": GEMINI_KEY,
+            // If using OAuth instead of API key:
+            // "Authorization": `Bearer ${process.env.GEMINI_OAUTH_TOKEN}`
+        },
+        perMessageDeflate: false
+    });
 
     let streamSid = null;
+    let setupSent = false;
 
     geminiWs.on("open", () => {
-        console.log("Connected to Gemini Live API.");
+        console.log("Gemini WS open, sending setup.");
         const setupMsg = {
             setup: {
-                model: GEMINI_MODEL,
+                model: liveModel,
+                // You can request both modalities
                 generationConfig: {
-                    responseModalities: ["AUDIO"],
-                    speechConfig: {
-                        voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } }
-                    }
+                    responseModalities: ["AUDIO", "TEXT"],
+                    temperature: 0.7
+                },
+                // Voice name may differ; fallback if Aoede unsupported.
+                speechConfig: {
+                    voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } }
                 }
             }
         };
         geminiWs.send(JSON.stringify(setupMsg));
+        setupSent = true;
     });
 
     geminiWs.on("message", (raw) => {
-        try {
-            const msg = JSON.parse(raw.toString());
+        let msg;
+        try { msg = JSON.parse(raw.toString()); } catch {
+            console.warn("Non-JSON Gemini frame.");
+            return;
+        }
 
-            if (msg.serverContent?.modelTurn?.parts) {
-                for (const part of msg.serverContent.modelTurn.parts) {
-                    if (part.inlineData && part.inlineData.mimeType.startsWith("audio/pcm")) {
-                        const b64 = part.inlineData.data;
-                        if (b64 && streamSid) {
-                            const pcmBuf = base64ToBuffer(b64);
-                            const int16 = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, Math.floor(pcmBuf.length / 2));
-                            const int16_8k = downsample16kTo8k(int16);
-                            const mulawBuf = pcm16Int16ArrayToMuLawBuffer(int16_8k);
+        // Log minimal diagnostics for unknown frames
+        if (!msg.serverContent && !msg.clientContent && !msg.error) {
+            console.debug("Gemini frame keys:", Object.keys(msg));
+        }
 
-                            const audioDelta = {
-                                event: "media",
-                                streamSid,
-                                media: { payload: bufferToBase64(mulawBuf) }
-                            };
-                            twilioWs.send(JSON.stringify(audioDelta));
-                        }
+        if (msg.error) {
+            console.error("Gemini error frame:", msg.error);
+            return;
+        }
+
+        // Audio output handling
+        const parts = msg.serverContent?.modelTurn?.parts;
+        if (Array.isArray(parts)) {
+            for (const part of parts) {
+                if (part.inlineData?.mimeType?.startsWith("audio/pcm")) {
+                    const b64 = part.inlineData.data;
+                    if (b64 && streamSid) {
+                        const pcmBuf = base64ToBuffer(b64);
+                        const int16 = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.length / 2);
+                        // Downsample (assumes 16k; if 24k you need a dedicated resampler)
+                        const int16_8k = downsample16kTo8k(int16);
+                        const mulawBuf = pcm16Int16ArrayToMuLawBuffer(int16_8k);
+                        twilioWs.send(JSON.stringify({
+                            event: "media",
+                            streamSid,
+                            media: { payload: bufferToBase64(mulawBuf) }
+                        }));
                     }
+                } else if (part.text) {
+                    console.log("Gemini text:", part.text);
                 }
             }
-        } catch (e) {
-            console.error("Error processing Gemini message:", e);
         }
     });
 
-    geminiWs.on("close", (code, reason) => console.log(`Gemini WS closed: ${code} ${reason}`));
+    geminiWs.on("close", (code, reason) => {
+        console.log(`Gemini WS closed: ${code} ${reason || ""}`);
+        if (!setupSent && code === 1006) {
+            console.error("Likely handshake failure: check endpoint, model, key, subprotocol.");
+        }
+    });
     geminiWs.on("error", (err) => console.error("Gemini WS error:", err));
 
     twilioWs.on("message", (msg) => {
-        try {
-            const event = JSON.parse(msg.toString());
-            if (event.event === "start") {
+        let event;
+        try { event = JSON.parse(msg.toString()); } catch {
+            console.warn("Non-JSON Twilio frame.");
+            return;
+        }
+
+        switch (event.event) {
+            case "start":
                 streamSid = event.start.streamSid;
                 console.log("Twilio stream start:", streamSid);
-            } else if (event.event === "media") {
-                const muLawBuf = base64ToBuffer(event.media.payload);
-                const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuf);
-                const pcm16_16k = upsample8kTo16k(pcm16_8k);
-                const pcmBuf = Buffer.from(pcm16_16k.buffer);
-
+                break;
+            case "media":
                 if (geminiWs.readyState === WebSocket.OPEN) {
+                    const muLawBuf = base64ToBuffer(event.media.payload);
+                    const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuf);
+                    const pcm16_16k = upsample8kTo16k(pcm16_8k);
+                    const pcmBuf = Buffer.from(pcm16_16k.buffer);
                     const realtimeInput = {
                         realtimeInput: {
                             mediaChunks: [{
@@ -230,12 +285,15 @@ wss.on("connection", async (twilioWs, req) => {
                     };
                     geminiWs.send(JSON.stringify(realtimeInput));
                 }
-            } else if (event.event === "stop") {
+                break;
+            case "stop":
                 console.log("Twilio stream stopped.");
-                if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-            }
-        } catch (e) {
-            console.error("Error processing Twilio message:", e);
+                if (geminiWs.readyState === WebSocket.OPEN) {
+                    try { geminiWs.close(); } catch { }
+                }
+                break;
+            default:
+                break;
         }
     });
 
@@ -243,9 +301,9 @@ wss.on("connection", async (twilioWs, req) => {
         console.log("Twilio WS closed, closing Gemini WS.");
         if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
     });
-
     twilioWs.on("error", (err) => console.error("Twilio WS error:", err));
 });
+// ...existing code...
 
 const server = app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
 
