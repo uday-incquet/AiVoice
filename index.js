@@ -111,7 +111,7 @@ wss.on('connection', async (ws) => {
         };
 
         geminiSession = await ai.live.connect({
-            model: GEMINI_MODEL,
+            model: 'gemini-2.5-flash',
             config,
             callbacks: {
                 onopen: () => {
