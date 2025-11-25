@@ -153,17 +153,20 @@ wss.on('connection', async (ws) => {
                 case 'media':
                     if (!geminiSession) return;
                     const payload = data.media.payload;
-                    const chunk = convertMulawBase64ToPcm16Base64(payload);
-                    console.debug('Converted audio chunk size (base64 chars):', chunk ? chunk.length : 'null', chunk);
-                    if (!chunk) {
+                    const chunkBuffer = convertMulawBase64ToPcm16Buffer(payload);
+                    console.debug(
+                        'Converted audio chunk size (bytes):',
+                        chunkBuffer ? chunkBuffer.byteLength : 'null'
+                    );
+                    if (!chunkBuffer) {
                         console.warn('Skipping empty chunk from Twilio');
                         return;
                     }
 
                     if (sessionReady) {
-                        sendAudioChunkToGemini(chunk);
+                        sendAudioChunkToGemini(chunkBuffer);
                     } else {
-                        pendingAudio.push(chunk);
+                        pendingAudio.push(chunkBuffer);
                         console.debug('Queued chunk; session not ready yet. Queue length:', pendingAudio.length);
                     }
                     break;
@@ -217,19 +220,19 @@ wss.on('connection', async (ws) => {
         pendingAudio.length = 0;
     }
 
-    function sendAudioChunkToGemini(base64Pcm16) {
+    function sendAudioChunkToGemini(buffer16k) {
         if (!geminiSession || !sessionReady) {
             console.warn('Attempted to send audio before session ready');
             return;
         }
 
-        console.debug('Sending audio chunk to Gemini. Size (base64 chars):', base64Pcm16.length);
+        console.debug('Sending audio chunk to Gemini. Size (bytes):', buffer16k.byteLength);
 
         geminiSession.sendRealtimeInput({
             mediaChunks: [
                 {
                     mimeType: 'audio/pcm;rate=16000',
-                    data: base64Pcm16,
+                    data: buffer16k,
                 },
             ],
         });
@@ -252,8 +255,8 @@ wss.on('connection', async (ws) => {
                     continue;
                 }
 
-                const { muLawBase64, durationMs } = convertGeminiAudioToMulawBase64(data, mimeType);
-                if (!muLawBase64) {
+                const { muLawBuffer, durationMs } = convertGeminiAudioToMulawBuffer(data, mimeType);
+                if (!muLawBuffer) {
                     console.warn('Conversion to mu-law failed, skipping');
                     continue;
                 }
@@ -261,7 +264,7 @@ wss.on('connection', async (ws) => {
                 const audioMessage = {
                     event: 'media',
                     streamSid,
-                    media: { payload: muLawBase64 },
+                    media: { payload: muLawBuffer.toString('base64') },
                 };
 
                 if (ws.readyState === WebSocket.OPEN) {
@@ -279,25 +282,24 @@ wss.on('connection', async (ws) => {
     }
 });
 
-function convertMulawBase64ToPcm16Base64(mulawBase64) {
+function convertMulawBase64ToPcm16Buffer(mulawBase64) {
     try {
         const muLawBuffer = Buffer.from(mulawBase64, 'base64');
         console.debug('Decoded mu-law buffer length:', muLawBuffer.length);
         const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuffer);
         const pcm16_16k = upsample8kTo16k(pcm16_8k);
-        const pcmBuffer = Buffer.from(
+        return Buffer.from(
             pcm16_16k.buffer,
             pcm16_16k.byteOffset,
             pcm16_16k.byteLength
         );
-        return pcmBuffer.toString('base64');
     } catch (err) {
         console.error('Error converting mu-law to PCM16:', err);
         return null;
     }
 }
 
-function convertGeminiAudioToMulawBase64(base64Pcm, mimeType) {
+function convertGeminiAudioToMulawBuffer(base64Pcm, mimeType) {
     try {
         const pcmBuffer = Buffer.from(base64Pcm, 'base64');
         console.debug('Gemini PCM buffer length:', pcmBuffer.length);
@@ -328,12 +330,12 @@ function convertGeminiAudioToMulawBase64(base64Pcm, mimeType) {
         console.debug('PCM 8k sample count:', pcm16_8k.length);
         const muLawBuffer = pcm16Int16ArrayToMuLawBuffer(pcm16_8k);
         return {
-            muLawBase64: muLawBuffer.toString('base64'),
+            muLawBuffer,
             durationMs: Math.round((pcm16_8k.length / 8000) * 1000),
         };
     } catch (err) {
         console.error('Error converting Gemini audio:', err);
-        return { muLawBase64: null, durationMs: 0 };
+        return { muLawBuffer: null, durationMs: 0 };
     }
 }
 
