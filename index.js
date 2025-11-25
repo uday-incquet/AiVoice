@@ -6,14 +6,15 @@ import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, Modality, MediaResolution } from '@google/genai';
 import twilio from 'twilio';
+import 'dotenv/config';
+
 const AccessToken = twilio.jwt.AccessToken;
 const VoiceGrant = AccessToken.VoiceGrant;
-import 'dotenv/config';
 
 const app = express();
 const PORT = process.env.PORT || 5050;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'models/gemini-2.5-flash-native-audio-preview-09-2025';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'models/gemini-exp-1206-live';
 
 const SYSTEM_MESSAGE = `You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested in and is prepared to offer them facts. You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. Always stay positive, but work in a joke when appropriate.`;
 
@@ -93,6 +94,7 @@ wss.on('connection', async (ws) => {
     const pendingAudio = [];
 
     try {
+        console.log('Initializing Gemini session with model:', GEMINI_MODEL);
         const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
         const config = {
@@ -111,7 +113,7 @@ wss.on('connection', async (ws) => {
         };
 
         geminiSession = await ai.live.connect({
-            model: 'gemini-2.5-flash',
+            model: GEMINI_MODEL,
             config,
             callbacks: {
                 onopen: () => {
@@ -125,6 +127,7 @@ wss.on('connection', async (ws) => {
                     console.log('Gemini session closed:', e.reason);
                     sessionReady = false;
                     if (ws.readyState === WebSocket.OPEN) {
+                        console.log('Closing Twilio socket after Gemini close');
                         ws.close();
                     }
                 },
@@ -139,6 +142,7 @@ wss.on('connection', async (ws) => {
     ws.on('message', (raw) => {
         try {
             const data = JSON.parse(raw.toString());
+            console.debug('Received Twilio event:', data.event);
 
             switch (data.event) {
                 case 'start':
@@ -150,12 +154,16 @@ wss.on('connection', async (ws) => {
                     if (!geminiSession) return;
                     const payload = data.media.payload;
                     const chunk = convertMulawBase64ToPcm16Base64(payload);
-                    if (!chunk) return;
+                    if (!chunk) {
+                        console.warn('Skipping empty chunk from Twilio');
+                        return;
+                    }
 
                     if (sessionReady) {
                         sendAudioChunkToGemini(chunk);
                     } else {
                         pendingAudio.push(chunk);
+                        console.debug('Queued chunk; session not ready yet. Queue length:', pendingAudio.length);
                     }
                     break;
 
@@ -163,6 +171,7 @@ wss.on('connection', async (ws) => {
                     console.log('Stream stopped');
                     if (geminiSession) {
                         try {
+                            console.log('Closing Gemini session after Twilio stop');
                             geminiSession.close();
                         } catch (err) {
                             console.error('Error closing Gemini session:', err);
@@ -171,6 +180,7 @@ wss.on('connection', async (ws) => {
                     break;
 
                 default:
+                    console.debug('Unhandled Twilio event type:', data.event);
                     break;
             }
         } catch (error) {
@@ -182,6 +192,7 @@ wss.on('connection', async (ws) => {
         console.log('Twilio client disconnected');
         if (geminiSession) {
             try {
+                console.log('Closing Gemini session after WS close');
                 geminiSession.close();
             } catch (err) {
                 console.error('Error closing Gemini session:', err);
@@ -194,7 +205,10 @@ wss.on('connection', async (ws) => {
     });
 
     function flushPendingAudio() {
-        if (!pendingAudio.length) return;
+        if (!pendingAudio.length) {
+            console.debug('No pending audio to flush');
+            return;
+        }
         console.log(`Flushing ${pendingAudio.length} pending audio chunks to Gemini`);
         for (const chunk of pendingAudio) {
             sendAudioChunkToGemini(chunk);
@@ -203,7 +217,12 @@ wss.on('connection', async (ws) => {
     }
 
     function sendAudioChunkToGemini(base64Pcm16) {
-        if (!geminiSession || !sessionReady) return;
+        if (!geminiSession || !sessionReady) {
+            console.warn('Attempted to send audio before session ready');
+            return;
+        }
+
+        console.debug('Sending audio chunk to Gemini. Size (base64 chars):', base64Pcm16.length);
 
         geminiSession.sendRealtimeInput({
             mediaChunks: [
@@ -216,16 +235,27 @@ wss.on('connection', async (ws) => {
     }
 
     function handleGeminiMessage(message) {
+        console.debug('Gemini message keys:', Object.keys(message));
         const parts = message.serverContent?.modelTurn?.parts;
-        if (!Array.isArray(parts) || !streamSid) return;
+        if (!Array.isArray(parts) || !streamSid) {
+            console.debug('No modelTurn parts or missing streamSid');
+            return;
+        }
 
         for (const part of parts) {
             if (part.inlineData?.mimeType?.startsWith('audio/')) {
                 const { mimeType, data } = part.inlineData;
-                if (!data) continue;
+                console.debug('Received audio part from Gemini. Mime:', mimeType);
+                if (!data) {
+                    console.warn('Audio part missing data payload');
+                    continue;
+                }
 
                 const { muLawBase64, durationMs } = convertGeminiAudioToMulawBase64(data, mimeType);
-                if (!muLawBase64) continue;
+                if (!muLawBase64) {
+                    console.warn('Conversion to mu-law failed, skipping');
+                    continue;
+                }
 
                 const audioMessage = {
                     event: 'media',
@@ -235,10 +265,14 @@ wss.on('connection', async (ws) => {
 
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify(audioMessage));
-                    console.log(`Sent ${durationMs} ms of audio back to Twilio`);
+                    console.log(`Sent ${durationMs} ms of Gemini audio back to Twilio`);
+                } else {
+                    console.warn('Twilio socket closed; cannot send audio');
                 }
             } else if (part.text) {
-                console.log('Gemini text:', part.text);
+                console.log('Gemini text part:', part.text);
+            } else {
+                console.debug('Unhandled part type:', part);
             }
         }
     }
@@ -247,6 +281,7 @@ wss.on('connection', async (ws) => {
 function convertMulawBase64ToPcm16Base64(mulawBase64) {
     try {
         const muLawBuffer = Buffer.from(mulawBase64, 'base64');
+        console.debug('Decoded mu-law buffer length:', muLawBuffer.length);
         const pcm16_8k = muLawBufferToPcm16Int16Array(muLawBuffer);
         const pcm16_16k = upsample8kTo16k(pcm16_8k);
         const pcmBuffer = Buffer.from(
@@ -264,11 +299,13 @@ function convertMulawBase64ToPcm16Base64(mulawBase64) {
 function convertGeminiAudioToMulawBase64(base64Pcm, mimeType) {
     try {
         const pcmBuffer = Buffer.from(base64Pcm, 'base64');
+        console.debug('Gemini PCM buffer length:', pcmBuffer.length);
         let sampleRate = 16000;
         const rateMatch = mimeType.match(/rate=(\d+)/);
         if (rateMatch) {
             sampleRate = parseInt(rateMatch[1], 10);
         }
+        console.debug('Gemini audio sample rate:', sampleRate);
 
         let int16 = new Int16Array(
             pcmBuffer.buffer,
@@ -277,14 +314,17 @@ function convertGeminiAudioToMulawBase64(base64Pcm, mimeType) {
         );
 
         if (sampleRate === 24000) {
+            console.debug('Downsampling 24kHz -> 16kHz');
             int16 = downsample(int16, sampleRate, 16000);
             sampleRate = 16000;
         } else if (sampleRate !== 16000) {
+            console.debug(`Downsampling ${sampleRate}Hz -> 16000Hz`);
             int16 = downsample(int16, sampleRate, 16000);
             sampleRate = 16000;
         }
 
         const pcm16_8k = downsample16kTo8k(int16);
+        console.debug('PCM 8k sample count:', pcm16_8k.length);
         const muLawBuffer = pcm16Int16ArrayToMuLawBuffer(pcm16_8k);
         return {
             muLawBase64: muLawBuffer.toString('base64'),
