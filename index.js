@@ -154,6 +154,7 @@ wss.on('connection', async (ws) => {
                     if (!geminiSession) return;
                     const payload = data.media.payload;
                     const chunk = convertMulawBase64ToPcm16Base64(payload);
+                    console.debug('Converted audio chunk size (base64 chars):', chunk ? chunk.length : 'null', chunk);
                     if (!chunk) {
                         console.warn('Skipping empty chunk from Twilio');
                         return;
