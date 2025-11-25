@@ -229,12 +229,10 @@ wss.on('connection', async (ws) => {
         console.debug('Sending audio chunk to Gemini. Size (bytes):', buffer16k.byteLength);
 
         geminiSession.sendRealtimeInput({
-            mediaChunks: [
-                {
-                    mimeType: 'audio/pcm;rate=16000',
-                    data: buffer16k,
-                },
-            ],
+            audio: {
+                data: buffer16k,
+                mimeType: 'audio/pcm;rate=16000',
+            },
         });
     }
 
